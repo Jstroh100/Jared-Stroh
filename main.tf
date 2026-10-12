@@ -66,7 +66,7 @@ resource "random_password" "db_password" {
 }
 
 # ==========================================
-# 1. AWS: NETWORK, COMPUTE, SERVERLESS, EKS & RDS
+# 1. AWS: NETWORK, COMPUTE, SERVERLESS, EKS, RDS & LOGGING
 # ==========================================
 
 resource "aws_vpc" "main" {
@@ -354,8 +354,18 @@ resource "aws_db_instance" "aws_postgres" {
   }
 }
 
+# AWS Central Logging (CloudWatch)
+resource "aws_cloudwatch_log_group" "enterprise_logs" {
+  name              = "/enterprise/central-audit-logs"
+  retention_in_days = 30
+
+  tags = {
+    Environment = "Dev"
+  }
+}
+
 # ==========================================
-# 2. AZURE: NETWORK, COMPUTE, SERVERLESS, AKS & POSTGRESQL
+# 2. AZURE: NETWORK, COMPUTE, SERVERLESS, AKS, POSTGRESQL & LOGGING
 # ==========================================
 
 resource "azurerm_resource_group" "rg" {
@@ -393,7 +403,6 @@ resource "azurerm_subnet" "private" {
   address_prefixes     = ["10.1.2.0/24"]
 }
 
-# Dedicated delegated subnet for Azure PostgreSQL Flexible Server
 resource "azurerm_subnet" "db_subnet" {
   name                 = "azure-db-subnet"
   resource_group_name  = azurerm_resource_group.rg.name
@@ -568,7 +577,6 @@ resource "azurerm_kubernetes_cluster" "azure_k8s" {
   }
 }
 
-# Azure Managed Relational Database (PostgreSQL Flexible Server)
 resource "azurerm_postgresql_flexible_server" "azure_postgres" {
   name                   = "enterprise-azure-postgres-379020"
   resource_group_name    = azurerm_resource_group.rg.name
@@ -585,8 +593,21 @@ resource "azurerm_postgresql_flexible_server" "azure_postgres" {
   }
 }
 
+# Azure Central Logging (Log Analytics Workspace)
+resource "azurerm_log_analytics_workspace" "central_logs" {
+  name                = "enterprise-log-analytics-379020"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  sku                 = "PerGB2018"
+  retention_in_days   = 30
+
+  tags = {
+    Environment = "Dev"
+  }
+}
+
 # ==========================================
-# 3. GCP: NETWORK, COMPUTE, SERVERLESS, GKE & CLOUD SQL
+# 3. GCP: NETWORK, COMPUTE, SERVERLESS, GKE, CLOUD SQL & LOGGING
 # ==========================================
 
 resource "google_compute_network" "custom_vpc" {
@@ -706,7 +727,6 @@ resource "google_container_node_pool" "gcp_k8s_nodes" {
   }
 }
 
-# GCP Managed Relational Database (Cloud SQL PostgreSQL)
 resource "google_sql_database_instance" "gcp_postgres" {
   name             = "enterprise-gcp-postgres-379020"
   database_version = "POSTGRES_15"
@@ -727,4 +747,13 @@ resource "google_sql_user" "gcp_postgres_user" {
   name     = "dbadmin"
   instance = google_sql_database_instance.gcp_postgres.name
   password = random_password.db_password.result
+}
+
+# GCP Central Logging Sink
+resource "google_logging_project_sink" "central_logs" {
+  name        = "enterprise-gcp-central-sink"
+  destination = "storage.googleapis.com/jared-tf-state-379020"
+  filter      = "severity >= WARNING"
+
+  unique_writer_identity = true
 }
