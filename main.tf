@@ -22,6 +22,10 @@ terraform {
       source  = "hashicorp/archive"
       version = "~> 2.4"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.5"
+    }
   }
 
   backend "gcs" {
@@ -54,8 +58,15 @@ data "archive_file" "lambda_zip" {
   output_path = "${path.module}/src/handler.zip"
 }
 
+# Dynamic password generation for relational databases
+resource "random_password" "db_password" {
+  length           = 16
+  special          = true
+  override_special = "!#$%&*()-_=+[]{}<>:?"
+}
+
 # ==========================================
-# 1. AWS: NETWORK, COMPUTE, SERVERLESS & EKS
+# 1. AWS: NETWORK, COMPUTE, SERVERLESS, EKS & RDS
 # ==========================================
 
 resource "aws_vpc" "main" {
@@ -78,7 +89,6 @@ resource "aws_internet_gateway" "gw" {
   }
 }
 
-# Public Subnet in us-east-1a
 resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.1.0/24"
@@ -92,7 +102,6 @@ resource "aws_subnet" "public" {
   }
 }
 
-# Air-Gapped Private Subnet in us-east-1a
 resource "aws_subnet" "private" {
   vpc_id            = aws_vpc.main.id
   cidr_block        = "10.0.2.0/24"
@@ -105,7 +114,6 @@ resource "aws_subnet" "private" {
   }
 }
 
-# Additional Private Subnet in us-east-1b (EKS requires at least 2 AZs)
 resource "aws_subnet" "private_b" {
   vpc_id            = aws_vpc.main.id
   cidr_block        = "10.0.3.0/24"
@@ -317,8 +325,37 @@ resource "aws_eks_node_group" "aws_k8s_nodes" {
   ]
 }
 
+# AWS Managed Relational Database (RDS PostgreSQL)
+resource "aws_db_subnet_group" "rds_subnet_group" {
+  name       = "enterprise-rds-subnet-group"
+  subnet_ids = [aws_subnet.private.id, aws_subnet.private_b.id]
+
+  tags = {
+    Name = "enterprise-rds-subnet-group"
+  }
+}
+
+resource "aws_db_instance" "aws_postgres" {
+  identifier             = "enterprise-aws-postgres"
+  allocated_storage      = 20
+  engine                 = "postgres"
+  engine_version         = "15"
+  instance_class         = "db.t4g.micro"
+  db_name                = "appdb"
+  username               = "dbadmin"
+  password               = random_password.db_password.result
+  db_subnet_group_name   = aws_db_subnet_group.rds_subnet_group.name
+  vpc_security_group_ids = [aws_security_group.private_sg.id]
+  skip_final_snapshot    = true
+  publicly_accessible    = false
+
+  tags = {
+    Environment = "Dev"
+  }
+}
+
 # ==========================================
-# 2. AZURE: NETWORK, COMPUTE, SERVERLESS & AKS
+# 2. AZURE: NETWORK, COMPUTE, SERVERLESS, AKS & POSTGRESQL
 # ==========================================
 
 resource "azurerm_resource_group" "rg" {
@@ -354,6 +391,24 @@ resource "azurerm_subnet" "private" {
   resource_group_name  = azurerm_resource_group.rg.name
   virtual_network_name = azurerm_virtual_network.vnet.name
   address_prefixes     = ["10.1.2.0/24"]
+}
+
+# Dedicated delegated subnet for Azure PostgreSQL Flexible Server
+resource "azurerm_subnet" "db_subnet" {
+  name                 = "azure-db-subnet"
+  resource_group_name  = azurerm_resource_group.rg.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.1.3.0/24"]
+
+  delegation {
+    name = "fs_delegation"
+    service_delegation {
+      name = "Microsoft.DBforPostgreSQL/flexibleServers"
+      actions = [
+        "Microsoft.Network/virtualNetworks/subnets/join/action",
+      ]
+    }
+  }
 }
 
 resource "azurerm_network_security_group" "private_nsg" {
@@ -491,7 +546,6 @@ resource "azurerm_linux_function_app" "azure_function" {
   }
 }
 
-# Azure Managed Kubernetes (AKS)
 resource "azurerm_kubernetes_cluster" "azure_k8s" {
   name                = "enterprise-azure-aks"
   location            = azurerm_resource_group.rg.location
@@ -514,8 +568,25 @@ resource "azurerm_kubernetes_cluster" "azure_k8s" {
   }
 }
 
+# Azure Managed Relational Database (PostgreSQL Flexible Server)
+resource "azurerm_postgresql_flexible_server" "azure_postgres" {
+  name                   = "enterprise-azure-postgres-379020"
+  resource_group_name    = azurerm_resource_group.rg.name
+  location               = azurerm_resource_group.rg.location
+  version                = "15"
+  delegated_subnet_id    = azurerm_subnet.db_subnet.id
+  administrator_login    = "psqladmin"
+  administrator_password = random_password.db_password.result
+  sku_name               = "B_Standard_B1ms"
+  storage_mb             = 32768
+
+  tags = {
+    Environment = "Dev"
+  }
+}
+
 # ==========================================
-# 3. GCP: NETWORK, COMPUTE, SERVERLESS & GKE
+# 3. GCP: NETWORK, COMPUTE, SERVERLESS, GKE & CLOUD SQL
 # ==========================================
 
 resource "google_compute_network" "custom_vpc" {
@@ -607,7 +678,6 @@ resource "google_cloudfunctions2_function" "gcp_function" {
   }
 }
 
-# GCP Managed Kubernetes (GKE)
 resource "google_container_cluster" "gcp_k8s" {
   name                     = "enterprise-gcp-gke"
   location                 = "us-east1-b"
@@ -634,4 +704,27 @@ resource "google_container_node_pool" "gcp_k8s_nodes" {
       environment = "dev"
     }
   }
+}
+
+# GCP Managed Relational Database (Cloud SQL PostgreSQL)
+resource "google_sql_database_instance" "gcp_postgres" {
+  name             = "enterprise-gcp-postgres-379020"
+  database_version = "POSTGRES_15"
+  region           = "us-east1"
+
+  settings {
+    tier = "db-f1-micro"
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = google_compute_network.custom_vpc.id
+    }
+  }
+
+  deletion_protection = false
+}
+
+resource "google_sql_user" "gcp_postgres_user" {
+  name     = "dbadmin"
+  instance = google_sql_database_instance.gcp_postgres.name
+  password = random_password.db_password.result
 }
