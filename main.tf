@@ -18,6 +18,10 @@ terraform {
       source  = "hashicorp/tls"
       version = "~> 4.0"
     }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.4"
+    }
   }
 
   backend "gcs" {
@@ -43,8 +47,15 @@ provider "google" {
   region  = "us-east1"
 }
 
+# Dynamic packaging for Python Serverless Handler
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  source_file = "${path.module}/src/handler.py"
+  output_path = "${path.module}/src/handler.zip"
+}
+
 # ==========================================
-# 1. AWS ISOLATED NETWORK TOPOLOGY (10.0.0.0/16)
+# 1. AWS ISOLATED NETWORK, COMPUTE & SERVERLESS
 # ==========================================
 
 resource "aws_vpc" "main" {
@@ -169,8 +180,40 @@ resource "aws_instance" "test_vm" {
   }
 }
 
+# AWS Lambda Serverless
+resource "aws_iam_role" "lambda_exec" {
+  name = "enterprise_lambda_exec_role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
+  role       = aws_iam_role.lambda_exec.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_lambda_function" "test_lambda" {
+  filename         = data.archive_file.lambda_zip.output_path
+  function_name    = "enterprise-data-handler"
+  role             = aws_iam_role.lambda_exec.arn
+  handler          = "handler.lambda_handler"
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+  runtime          = "python3.11"
+
+  tags = {
+    Environment = "Dev"
+  }
+}
+
 # ==========================================
-# 2. AZURE ISOLATED NETWORK & COMPUTE (10.1.0.0/16)
+# 2. AZURE ISOLATED NETWORK, COMPUTE & SERVERLESS
 # ==========================================
 
 resource "azurerm_resource_group" "rg" {
@@ -307,8 +350,45 @@ resource "azurerm_linux_virtual_machine" "azure_test_vm" {
   }
 }
 
+# Azure Function App Serverless
+resource "azurerm_storage_account" "func_storage" {
+  name                     = "enterprisestorfn379020"
+  resource_group_name      = azurerm_resource_group.rg.name
+  location                 = azurerm_resource_group.rg.location
+  account_tier             = "Standard"
+  account_replication_type = "LRS"
+}
+
+resource "azurerm_service_plan" "func_plan" {
+  name                = "enterprise-func-service-plan"
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+  os_type             = "Linux"
+  sku_name            = "Y1"
+}
+
+resource "azurerm_linux_function_app" "azure_function" {
+  name                = "enterprise-fn-app-379020"
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+
+  storage_account_name       = azurerm_storage_account.func_storage.name
+  storage_account_access_key = azurerm_storage_account.func_storage.primary_access_key
+  service_plan_id            = azurerm_service_plan.func_plan.id
+
+  site_config {
+    application_stack {
+      python_version = "3.11"
+    }
+  }
+
+  tags = {
+    Environment = "Dev"
+  }
+}
+
 # ==========================================
-# 3. GCP ISOLATED NETWORK & COMPUTE (10.2.0.0/16)
+# 3. GCP ISOLATED NETWORK, COMPUTE & SERVERLESS
 # ==========================================
 
 resource "google_compute_network" "custom_vpc" {
@@ -360,6 +440,40 @@ resource "google_compute_instance" "gcp_test_vm" {
     access_config {
       // Ephemeral external IP
     }
+  }
+
+  labels = {
+    environment = "dev"
+  }
+}
+
+# GCP Cloud Functions Gen 2 Serverless
+resource "google_storage_bucket_object" "function_archive" {
+  name   = "handler.zip"
+  bucket = "jared-tf-state-379020"
+  source = data.archive_file.lambda_zip.output_path
+}
+
+resource "google_cloudfunctions2_function" "gcp_function" {
+  name        = "enterprise-gcp-function"
+  location    = "us-east1"
+  description = "Serverless Python micro-service"
+
+  build_config {
+    runtime     = "python311"
+    entry_point = "main"
+    source {
+      storage_source {
+        bucket = "jared-tf-state-379020"
+        object = google_storage_bucket_object.function_archive.name
+      }
+    }
+  }
+
+  service_config {
+    max_instance_count = 1
+    available_memory   = "256M"
+    timeout_seconds    = 60
   }
 
   labels = {
