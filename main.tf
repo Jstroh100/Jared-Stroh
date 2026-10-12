@@ -55,7 +55,7 @@ data "archive_file" "lambda_zip" {
 }
 
 # ==========================================
-# 1. AWS ISOLATED NETWORK, COMPUTE & SERVERLESS
+# 1. AWS: NETWORK, COMPUTE, SERVERLESS & EKS
 # ==========================================
 
 resource "aws_vpc" "main" {
@@ -78,6 +78,7 @@ resource "aws_internet_gateway" "gw" {
   }
 }
 
+# Public Subnet in us-east-1a
 resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.1.0/24"
@@ -85,19 +86,35 @@ resource "aws_subnet" "public" {
   map_public_ip_on_launch = true
 
   tags = {
-    Name = "aws-public-subnet"
-    Tier = "Public"
+    Name                     = "aws-public-subnet"
+    Tier                     = "Public"
+    "kubernetes.io/role/elb" = "1"
   }
 }
 
+# Air-Gapped Private Subnet in us-east-1a
 resource "aws_subnet" "private" {
   vpc_id            = aws_vpc.main.id
   cidr_block        = "10.0.2.0/24"
   availability_zone = "us-east-1a"
 
   tags = {
-    Name = "aws-private-subnet"
-    Tier = "Private-Isolated"
+    Name                              = "aws-private-subnet"
+    Tier                              = "Private-Isolated"
+    "kubernetes.io/role/internal-elb" = "1"
+  }
+}
+
+# Additional Private Subnet in us-east-1b (EKS requires at least 2 AZs)
+resource "aws_subnet" "private_b" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.3.0/24"
+  availability_zone = "us-east-1b"
+
+  tags = {
+    Name                              = "aws-private-subnet-b"
+    Tier                              = "Private-Isolated"
+    "kubernetes.io/role/internal-elb" = "1"
   }
 }
 
@@ -129,6 +146,11 @@ resource "aws_route_table" "private_rt" {
 
 resource "aws_route_table_association" "private_assoc" {
   subnet_id      = aws_subnet.private.id
+  route_table_id = aws_route_table.private_rt.id
+}
+
+resource "aws_route_table_association" "private_b_assoc" {
+  subnet_id      = aws_subnet.private_b.id
   route_table_id = aws_route_table.private_rt.id
 }
 
@@ -212,8 +234,91 @@ resource "aws_lambda_function" "test_lambda" {
   }
 }
 
+# AWS Managed Kubernetes (EKS)
+resource "aws_iam_role" "eks_cluster_role" {
+  name = "enterprise_eks_cluster_role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "eks.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
+  role       = aws_iam_role.eks_cluster_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+}
+
+resource "aws_iam_role" "eks_node_role" {
+  name = "enterprise_eks_node_role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "eks_worker_node_policy" {
+  role       = aws_iam_role.eks_node_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+}
+
+resource "aws_iam_role_policy_attachment" "eks_cni_policy" {
+  role       = aws_iam_role.eks_node_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+}
+
+resource "aws_iam_role_policy_attachment" "eks_registry_policy" {
+  role       = aws_iam_role.eks_node_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+resource "aws_eks_cluster" "aws_k8s" {
+  name     = "enterprise-aws-eks"
+  role_arn = aws_iam_role.eks_cluster_role.arn
+  version  = "1.28"
+
+  vpc_config {
+    subnet_ids = [aws_subnet.private.id, aws_subnet.private_b.id]
+  }
+
+  depends_on = [aws_iam_role_policy_attachment.eks_cluster_policy]
+
+  tags = {
+    Environment = "Dev"
+  }
+}
+
+resource "aws_eks_node_group" "aws_k8s_nodes" {
+  cluster_name    = aws_eks_cluster.aws_k8s.name
+  node_group_name = "enterprise-aws-nodes"
+  node_role_arn   = aws_iam_role.eks_node_role.arn
+  subnet_ids      = [aws_subnet.private.id, aws_subnet.private_b.id]
+  instance_types  = ["t3.micro"]
+
+  scaling_config {
+    desired_size = 1
+    max_size     = 1
+    min_size     = 1
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.eks_worker_node_policy,
+    aws_iam_role_policy_attachment.eks_cni_policy,
+    aws_iam_role_policy_attachment.eks_registry_policy,
+  ]
+}
+
 # ==========================================
-# 2. AZURE ISOLATED NETWORK, COMPUTE & SERVERLESS
+# 2. AZURE: NETWORK, COMPUTE, SERVERLESS & AKS
 # ==========================================
 
 resource "azurerm_resource_group" "rg" {
@@ -350,7 +455,6 @@ resource "azurerm_linux_virtual_machine" "azure_test_vm" {
   }
 }
 
-# Azure Function App Serverless
 resource "azurerm_storage_account" "func_storage" {
   name                     = "enterprisestorfn379020"
   resource_group_name      = azurerm_resource_group.rg.name
@@ -387,8 +491,31 @@ resource "azurerm_linux_function_app" "azure_function" {
   }
 }
 
+# Azure Managed Kubernetes (AKS)
+resource "azurerm_kubernetes_cluster" "azure_k8s" {
+  name                = "enterprise-azure-aks"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  dns_prefix          = "enterprise-aks"
+
+  default_node_pool {
+    name           = "default"
+    node_count     = 1
+    vm_size        = "Standard_B2s"
+    vnet_subnet_id = azurerm_subnet.private.id
+  }
+
+  identity {
+    type = "SystemAssigned"
+  }
+
+  tags = {
+    Environment = "Dev"
+  }
+}
+
 # ==========================================
-# 3. GCP ISOLATED NETWORK, COMPUTE & SERVERLESS
+# 3. GCP: NETWORK, COMPUTE, SERVERLESS & GKE
 # ==========================================
 
 resource "google_compute_network" "custom_vpc" {
@@ -447,7 +574,6 @@ resource "google_compute_instance" "gcp_test_vm" {
   }
 }
 
-# GCP Cloud Functions Gen 2 Serverless
 resource "google_storage_bucket_object" "function_archive" {
   name   = "handler.zip"
   bucket = "jared-tf-state-379020"
@@ -478,5 +604,34 @@ resource "google_cloudfunctions2_function" "gcp_function" {
 
   labels = {
     environment = "dev"
+  }
+}
+
+# GCP Managed Kubernetes (GKE)
+resource "google_container_cluster" "gcp_k8s" {
+  name                     = "enterprise-gcp-gke"
+  location                 = "us-east1-b"
+  remove_default_node_pool = true
+  initial_node_count       = 1
+  network                  = google_compute_network.custom_vpc.id
+  subnetwork               = google_compute_subnetwork.private.id
+
+  deletion_protection = false
+}
+
+resource "google_container_node_pool" "gcp_k8s_nodes" {
+  name       = "enterprise-gcp-nodes"
+  location   = "us-east1-b"
+  cluster    = google_container_cluster.gcp_k8s.name
+  node_count = 1
+
+  node_config {
+    machine_type = "e2-micro"
+    oauth_scopes = [
+      "https://www.googleapis.com/auth/cloud-platform"
+    ]
+    labels = {
+      environment = "dev"
+    }
   }
 }
