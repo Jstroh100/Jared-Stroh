@@ -14,6 +14,10 @@ terraform {
       source  = "hashicorp/google"
       version = "~> 5.0"
     }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
   }
 
   backend "gcs" {
@@ -21,6 +25,10 @@ terraform {
     prefix = "terraform/state"
   }
 }
+
+# ==========================================
+# PROVIDER CONFIGURATIONS
+# ==========================================
 
 provider "aws" {
   region = "us-east-1"
@@ -139,8 +147,30 @@ resource "aws_security_group" "private_sg" {
   }
 }
 
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-2023.*-x86_64"]
+  }
+}
+
+resource "aws_instance" "test_vm" {
+  ami                         = data.aws_ami.amazon_linux.id
+  instance_type               = "t3.micro"
+  subnet_id                   = aws_subnet.public.id
+  associate_public_ip_address = true
+
+  tags = {
+    Name        = "aws-routing-test-vm"
+    Environment = "Dev"
+  }
+}
+
 # ==========================================
-# 2. AZURE ISOLATED NETWORK TOPOLOGY (10.1.0.0/16)
+# 2. AZURE ISOLATED NETWORK & COMPUTE (10.1.0.0/16)
 # ==========================================
 
 resource "azurerm_resource_group" "rg" {
@@ -217,8 +247,68 @@ resource "azurerm_subnet_network_security_group_association" "nsg_assoc" {
   network_security_group_id = azurerm_network_security_group.private_nsg.id
 }
 
+resource "tls_private_key" "azure_ssh" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+resource "azurerm_public_ip" "azure_vm_pip" {
+  name                = "azure-vm-pip"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+}
+
+resource "azurerm_network_interface" "azure_vm_nic" {
+  name                = "azure-vm-nic"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.public.id
+    private_ip_address_allocation = "Dynamic"
+    public_ip_address_id          = azurerm_public_ip.azure_vm_pip.id
+  }
+}
+
+resource "azurerm_linux_virtual_machine" "azure_test_vm" {
+  name                            = "azure-test-vm"
+  resource_group_name             = azurerm_resource_group.rg.name
+  location                        = azurerm_resource_group.rg.location
+  size                            = "Standard_B1s"
+  admin_username                  = "azureuser"
+  disable_password_authentication = true
+
+  network_interface_ids = [
+    azurerm_network_interface.azure_vm_nic.id,
+  ]
+
+  admin_ssh_key {
+    username   = "azureuser"
+    public_key = tls_private_key.azure_ssh.public_key_openssh
+  }
+
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-jammy"
+    sku       = "22_04-lts"
+    version   = "latest"
+  }
+
+  tags = {
+    Environment = "Dev"
+  }
+}
+
 # ==========================================
-# 3. GCP ISOLATED NETWORK TOPOLOGY (10.2.0.0/16)
+# 3. GCP ISOLATED NETWORK & COMPUTE (10.2.0.0/16)
 # ==========================================
 
 resource "google_compute_network" "custom_vpc" {
@@ -251,4 +341,28 @@ resource "google_compute_firewall" "allow_internal_only" {
 
   source_ranges = ["10.2.0.0/16"]
   description   = "Permit ingress strictly from internal GCP VPC CIDR"
+}
+
+resource "google_compute_instance" "gcp_test_vm" {
+  name         = "gcp-routing-test-vm"
+  machine_type = "e2-micro"
+  zone         = "us-east1-b"
+
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-11"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.public.id
+
+    access_config {
+      // Ephemeral external IP
+    }
+  }
+
+  labels = {
+    environment = "dev"
+  }
 }
